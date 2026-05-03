@@ -1,0 +1,182 @@
+name: Oracle A1 capacity poll
+
+# 5분마다 자동 시도. GitHub Actions cron은 best-effort라 실제 5~15분 간격.
+# Public repo라 Actions 무제한.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Install OCI CLI
+        run: |
+          set -e
+          curl -L -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          bash install.sh --accept-all-defaults --install-dir /tmp/oci-cli --exec-dir /tmp/oci-bin --update-path-and-enable-tab-completion >/dev/null
+          echo "/tmp/oci-bin" >> $GITHUB_PATH
+
+      - name: Configure OCI auth
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=/home/runner/.oci/key.pem
+          EOF
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem ~/.oci/config
+
+      - name: Discover compartment, subnet, image, ADs
+        id: discover
+        run: |
+          set -e
+          # Root compartment = tenancy OCID
+          COMPARTMENT="${{ secrets.OCI_TENANCY_OCID }}"
+          echo "compartment=$COMPARTMENT" >> $GITHUB_OUTPUT
+
+          # Subnet — public subnet of mile-manager-vcn
+          SUBNET=$(oci network subnet list \
+            --compartment-id "$COMPARTMENT" \
+            --query "data[?contains(\"display-name\", 'public')] | [0].id" \
+            --raw-output)
+          echo "subnet=$SUBNET" >> $GITHUB_OUTPUT
+          echo "Subnet: $SUBNET"
+
+          # Latest Ubuntu 22.04 aarch64 image for A1.Flex
+          IMAGE=$(oci compute image list \
+            --compartment-id "$COMPARTMENT" \
+            --operating-system 'Canonical Ubuntu' \
+            --operating-system-version '22.04' \
+            --shape 'VM.Standard.A1.Flex' \
+            --sort-by TIMECREATED --sort-order DESC \
+            --query "data[?contains(\"display-name\", 'aarch64')] | [0].id" \
+            --raw-output)
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "Image: $IMAGE"
+
+          # Availability domains (Phoenix has 3)
+          ADS_JSON=$(oci iam availability-domain list \
+            --compartment-id "$COMPARTMENT" \
+            --query 'data[].name')
+          echo "ads_json=$ADS_JSON" >> $GITHUB_OUTPUT
+          echo "ADs: $ADS_JSON"
+
+      - name: Try launch in each AD
+        id: launch
+        run: |
+          set +e
+          # Parse JSON array of AD names
+          ADS=$(echo '${{ steps.discover.outputs.ads_json }}' | jq -r '.[]')
+
+          for AD in $ADS; do
+            echo "==================================="
+            echo "Trying AD: $AD"
+            echo "==================================="
+
+            RESULT=$(oci compute instance launch \
+              --availability-domain "$AD" \
+              --compartment-id "${{ steps.discover.outputs.compartment }}" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config '{"ocpus": 4, "memoryInGBs": 24}' \
+              --image-id "${{ steps.discover.outputs.image }}" \
+              --subnet-id "${{ steps.discover.outputs.subnet }}" \
+              --metadata "{\"ssh_authorized_keys\": \"${{ secrets.OCI_SSH_PUBLIC_KEY }}\"}" \
+              --display-name 'mile-manager' \
+              --assign-public-ip true \
+              --wait-for-state RUNNING \
+              --max-wait-seconds 180 \
+              2>&1)
+            EXIT=$?
+
+            if [ $EXIT -eq 0 ]; then
+              echo "🎉 SUCCESS in $AD"
+              INSTANCE_ID=$(echo "$RESULT" | jq -r '.data.id')
+              # Wait for VNIC + get public IP
+              sleep 5
+              PUBLIC_IP=$(oci compute instance list-vnics \
+                --instance-id "$INSTANCE_ID" \
+                --query 'data[0]."public-ip"' \
+                --raw-output 2>/dev/null || echo "unknown")
+
+              echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+              echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+              echo "ad=$AD" >> $GITHUB_OUTPUT
+              echo "success=true" >> $GITHUB_OUTPUT
+              exit 0
+            elif echo "$RESULT" | grep -qi 'out of host capacity\|out of capacity\|capacity\|InternalError'; then
+              echo "Out of capacity in $AD — trying next..."
+              continue
+            else
+              echo "❌ Unexpected error in $AD:"
+              echo "$RESULT" | head -c 1000
+              # Save error for issue body
+              echo "$RESULT" | head -c 800 > /tmp/error.txt
+              echo "error_ad=$AD" >> $GITHUB_OUTPUT
+              echo "success=false_unexpected" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+
+          echo "All ADs full this round"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: Create GitHub Issue on success
+        if: steps.launch.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🎉 Oracle A1 acquired! IP: ${{ steps.launch.outputs.public_ip }}" \
+            --body "**A1 인스턴스 잡힘 — Mile Manager 배포 시작 가능**
+
+          - **AD**: ${{ steps.launch.outputs.ad }}
+          - **Public IP**: \`${{ steps.launch.outputs.public_ip }}\`
+          - **Instance ID**: \`${{ steps.launch.outputs.instance_id }}\`
+          - **시각**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+
+          ## 다음 단계 (laptop에서)
+
+          \`\`\`powershell
+          # 1. SSH 접속 테스트
+          ssh ubuntu@${{ steps.launch.outputs.public_ip }}
+
+          # 2. Mile Manager deploy
+          Set-Location C:\\Users\\dorzz\\projects\\mileage-bot
+          # ... deploy/setup_vm.sh 등 README 참고
+          \`\`\`
+
+          Workflow가 자동으로 disable됨 — 다음 cron 시도 안 함."
+
+      - name: Create GitHub Issue on unexpected error
+        if: steps.launch.outputs.success == 'false_unexpected'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ERROR=$(cat /tmp/error.txt 2>/dev/null || echo "no error log")
+          gh issue create \
+            --title "⚠️ A1 polling unexpected error in ${{ steps.launch.outputs.error_ad }}" \
+            --body "Polling 중 capacity 외의 에러 발생:
+
+          \`\`\`
+          $ERROR
+          \`\`\`
+
+          가능한 원인: OCI auth 만료, image/subnet OCID 변경, quota 초과 등.
+          확인 후 workflow re-enable: \`gh workflow enable poll-a1.yml --repo youngsancha/oracle-a1-grabber\`"
+
+      - name: Disable workflow on success
+        if: steps.launch.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow disable poll-a1.yml --repo ${{ github.repository }}
+          echo "✓ Workflow disabled — no more polling"
