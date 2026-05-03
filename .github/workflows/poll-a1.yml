@@ -62,10 +62,10 @@ jobs:
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
           echo "Image: $IMAGE"
 
-          # Availability domains (Phoenix has 3)
+          # Availability domains (Phoenix has 3) — compress to single line for GH Actions output
           ADS_JSON=$(oci iam availability-domain list \
             --compartment-id "$COMPARTMENT" \
-            --query 'data[].name')
+            --query 'data[].name' | jq -c .)
           echo "ads_json=$ADS_JSON" >> $GITHUB_OUTPUT
           echo "ADs: $ADS_JSON"
 
