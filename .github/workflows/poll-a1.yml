@@ -10,7 +10,7 @@ on:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Install OCI CLI
@@ -81,7 +81,9 @@ jobs:
             echo "Trying AD: $AD"
             echo "==================================="
 
-            RESULT=$(oci compute instance launch \
+            # per-AD bash timeout 90s (안전망 — OCI CLI hang 방지)
+            # --max-wait-seconds 60 (RUNNING 상태 대기 짧게)
+            RESULT=$(timeout 90 oci compute instance launch \
               --availability-domain "$AD" \
               --compartment-id "${{ steps.discover.outputs.compartment }}" \
               --shape VM.Standard.A1.Flex \
@@ -92,9 +94,14 @@ jobs:
               --display-name 'mile-manager' \
               --assign-public-ip true \
               --wait-for-state RUNNING \
-              --max-wait-seconds 180 \
+              --max-wait-seconds 60 \
               2>&1)
             EXIT=$?
+            # exit 124 = bash timeout fired
+            if [ $EXIT -eq 124 ]; then
+              echo "Timed out waiting for $AD launch — treating as transient"
+              continue
+            fi
 
             if [ $EXIT -eq 0 ]; then
               echo "🎉 SUCCESS in $AD"
