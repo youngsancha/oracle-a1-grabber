@@ -7,6 +7,12 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+# Default GITHUB_TOKEN 은 read-only — issue 생성하려면 명시적 write 권한 필요
+permissions:
+  contents: read
+  issues: write
+  actions: write    # workflow disable on success 위해
+
 jobs:
   poll:
     runs-on: ubuntu-latest
